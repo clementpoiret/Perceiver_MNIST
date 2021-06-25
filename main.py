@@ -4,6 +4,9 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
 from torchvision import transforms
 from torchvision.datasets.mnist import MNIST
+from torchmetrics.functional import accuracy
+from pytorch_lightning.callbacks import ModelCheckpoint
+
 
 from utils.perceiver import Perceiver
 
@@ -62,54 +65,108 @@ class PerceiverClassifier(pl.LightningModule):
 
         return loss
 
-    def validation_step(self, batch, batch_idx):
+    def evaluate(self, batch, stage=None):
         x, y = batch
         x = x.permute(0, 2, 3, 1)
-        y_hat = self(x)
-        loss = F.cross_entropy(y_hat, y)
+        logits = self(x)
+        loss = F.cross_entropy(logits, y)
+        preds = torch.argmax(logits, dim=1)
+        acc = accuracy(preds, y)
 
-        self.log("Validation Loss", loss)
+        if stage:
+            self.log(f'{stage}_loss', loss, prog_bar=True)
+            self.log(f'{stage}_acc', acc, prog_bar=True)
+        return {'loss': loss, 'acc': acc, 'preds': preds, 'y': y}
 
-        return loss
+    def epoch_evaluate(self, step_outputs, stage=None):
+        y_list = []
+        preds_list = []
+        loss_list = []
+        acc_list = []
+        for output in step_outputs:
+            # print(output)
+            y_list.append(output['y'])
+            preds_list.append(output['preds'])
+            loss_list.append(output['loss'])
+            acc_list.append(output['acc'])
+        # print(loss_list)
+        y_cat = torch.cat(y_list)
+        preds_cat = torch.cat(preds_list)
+        loss_cat = torch.tensor(loss_list)
+        acc_cat = torch.tensor(acc_list)
+        acc = accuracy(preds_cat, y_cat)
+        loss = torch.mean(loss_cat)
+        macc = torch.mean(acc_cat)
+
+        if stage:
+            self.log(f'{stage}_epoch_acc', acc)
+            self.log(f'{stage}_epoch_loss', loss)
+            self.log(f'{stage}_epoch_macc', macc)
+
+    def validation_step(self, batch, batch_idx):
+        return self.evaluate(batch, 'val')
+
+    def validation_epoch_end(self, val_step_outputs):
+        self.epoch_evaluate(val_step_outputs, 'val')
 
     def test_step(self, batch, batch_idx):
-        x, y = batch
-        x = x.permute(0, 2, 3, 1)
-        y_hat = self(x)
-        loss = F.cross_entropy(y_hat, y)
+        return self.evaluate(batch, 'test')
 
-        self.log('Test Loss', loss)
+    def test_epoch_end(self, test_step_outputs):
+        self.epoch_evaluate(test_step_outputs, 'test')
 
     def configure_optimizers(self):
-        return torch.optim.AdamW(self.parameters())
+        optimizer = torch.optim.AdamW(self.parameters(), lr=0.001)
+        return {
+            'optimizer': optimizer,
+            'lr_scheduler': {
+                'scheduler': torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.9),
+                'monitor': 'metric_to_track',
+            }
+        }
 
 
 def main():
+
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.1307,), (0.3081,))
+    ])
+
     dataset = MNIST(root='./',
                     train=True,
                     download=True,
-                    transform=transforms.ToTensor())
+                    transform=transform)
     mnist_test = MNIST(root='./',
                        train=False,
                        download=True,
-                       transform=transforms.ToTensor())
-    mnist_train, mnist_val = random_split(dataset, [55000, 5000])
+                       transform=transform)
+    #mnist_train, mnist_val = random_split(dataset, [55000, 5000])
+    mnist_train, mnist_val = random_split(dataset, [59500, 500])
 
-    train_loader = DataLoader(mnist_train, batch_size=16, num_workers=24)
-    val_loader = DataLoader(mnist_val, batch_size=16, num_workers=24)
-    test_loader = DataLoader(mnist_test, batch_size=16, num_workers=24)
+    train_loader = DataLoader(mnist_train, batch_size=64, num_workers=8)
+    val_loader = DataLoader(mnist_val, batch_size=64, num_workers=8)
+    test_loader = DataLoader(mnist_test, batch_size=64, num_workers=8)
+
+    mc = ModelCheckpoint(
+        monitor='val_epoch_acc', 
+        dirpath='./', 
+        filename='mnist-{epoch:02d}-{val_epoch_acc:.2f}',
+        mode='max')
 
     model = PerceiverClassifier(input_channels=1,
+                                depth=1,
+                                attn_dropout=0.,
+                                ff_dropout=0.,
                                 num_classes=10,
                                 weight_tie_layers=True)
-
     trainer = pl.Trainer(gpus=1,
                          precision=32,
                          log_gpu_memory=True,
-                         max_epochs=32,
+                         max_epochs=40,
                          progress_bar_refresh_rate=5,
                          benchmark=True,
-                         checkpoint_callback=False)
+                         callbacks=[mc])
     trainer.fit(model, train_loader, val_loader)
     trainer.test(test_dataloaders=test_loader)
 
